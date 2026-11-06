@@ -328,6 +328,12 @@ public class PreferenceConfiguration {
     //物理光标捕获
     public boolean enableMouseLocalCursor;
 
+    // Emulated local cursor: drawn by the client over the stream, positioned with zero latency
+    public boolean enableEmulatedLocalCursor;
+    public boolean emulatedCursorHideHost;
+    public int emulatedCursorSize;        // percent of the host's 100% cursor size
+    public int emulatedCursorSensitivity; // percent
+
     public boolean enableMultiTouchGestures;
 
     //禁用内置的特殊指令
@@ -981,6 +987,11 @@ private static int getFramePacingValue(Context context) {
         config.enableTouchSensitivity=prefs.getBoolean("checkbox_enable_touch_sensitivity",false);
 
         config.enableMouseLocalCursor=prefs.getBoolean("checkbox_mouse_local_cursor",false);
+
+        config.enableEmulatedLocalCursor = prefs.getBoolean("checkbox_emulated_local_cursor", false);
+        config.emulatedCursorHideHost = prefs.getBoolean("checkbox_emulated_cursor_hide_host", true);
+        config.emulatedCursorSize = prefs.getInt("seekbar_emulated_cursor_size", 100);
+        config.emulatedCursorSensitivity = prefs.getInt("seekbar_emulated_cursor_sensitivity", 100);
 
         config.enableMultiTouchGestures = prefs.getBoolean("checkbox_multi_touch_gestures", false);
 

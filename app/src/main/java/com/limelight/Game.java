@@ -13,6 +13,7 @@ import com.limelight.binding.audio.AndroidAudioRenderer;
 import com.limelight.binding.input.ControllerHandler;
 import com.limelight.binding.input.GameInputDevice;
 import com.limelight.binding.input.KeyboardTranslator;
+import com.limelight.binding.input.LocalCursorController;
 import com.limelight.binding.input.capture.InputCaptureManager;
 import com.limelight.binding.input.capture.InputCaptureProvider;
 import com.limelight.binding.input.touch.AbsoluteTouchContext;
@@ -42,6 +43,7 @@ import com.limelight.preferences.PreferenceConfiguration;
 import com.limelight.profiles.ProfilesManager;
 import com.limelight.ui.ExternalControllerView;
 import com.limelight.ui.GameGestures;
+import com.limelight.ui.LocalCursorView;
 import com.limelight.ui.StreamContainer;
 import com.limelight.utils.Dialog;
 import com.limelight.utils.ExternalDisplayControlActivity;
@@ -201,6 +203,11 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     private int modifierFlags = 0;
     private boolean grabbedInput = true;
     private boolean cursorVisible = false;
+    // Emulated (Parsec-style) local cursor drawn over the stream. Null for 3D render modes.
+    private LocalCursorController localCursor;
+    private LocalCursorView localCursorView;
+    // Pointer ID of the native touch the host moves its cursor with, or -1
+    private int primaryTouchPointerId = -1;
     private boolean isPanZoomMode = false;
     private boolean synthClickPending = false;
     private boolean pointerSwiping = false;
@@ -485,6 +492,24 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                 streamContainer,
                 prefConfig
         );
+
+        // The emulated cursor sits above the video surface inside the stream container.
+        // Stereo 3D modes warp the image, so a flat overlay can't line up there.
+        if (streamContainer.mapIntToStreamMode(prefConfig.renderMode) == StreamContainer.StreamMode.MODE_2D) {
+            localCursorView = new LocalCursorView(this);
+            streamContainer.addView(localCursorView, new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    Gravity.TOP | Gravity.START));
+            panZoomHandler.setOnTransformChangedListener(this::onVideoGeometryChanged);
+            streamContainer.getSurfaceView().addOnLayoutChangeListener(
+                    (v, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom) -> onVideoGeometryChanged());
+
+            // The emulated cursor replaces the Android cursor, but only where it is available
+            if (prefConfig.enableEmulatedLocalCursor) {
+                cursorVisible = false;
+            }
+        }
 
         // Restore previous zoom & pan if enabled and saved
         if (prefConfig.rememberZoomPan) {
@@ -808,6 +833,14 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                 PlatformBinding.getCryptoProvider(this), serverCert);
         controllerHandler = new ControllerHandler(this, conn, this, prefConfig);
         keyboardTranslator = new KeyboardTranslator(prefConfig);
+        if (localCursorView != null) {
+            localCursor = new LocalCursorController(conn, streamContainer.getSurfaceView(), localCursorView,
+                    displayWidth, displayHeight,
+                    // Apollo scales its virtual desktop by this factor; the stream size stays put
+                    prefConfig.resolutionScaleFactor / 100f,
+                    prefConfig.emulatedCursorSize / 100f,
+                    prefConfig.emulatedCursorSensitivity / 100f);
+        }
 
         InputManager inputManager = (InputManager) getSystemService(Context.INPUT_SERVICE);
         inputManager.registerInputDeviceListener(keyboardTranslator, null);
@@ -1880,6 +1913,10 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         setMetaKeyCaptureState(grab);
 
         grabbedInput = grab;
+
+        if (localCursor != null) {
+            localCursor.setSuspended(!grab);
+        }
     }
 
     private final Runnable toggleGrab = new Runnable() {
@@ -1961,16 +1998,12 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
                     // Toggle cursor visibility
                     case KeyEvent.KEYCODE_C:
-                        if (!grabbedInput) {
-                            inputCaptureProvider.enableCapture();
-                            grabbedInput = true;
-                        }
-                        cursorVisible = !cursorVisible;
-                        if (cursorVisible) {
-                            inputCaptureProvider.showCursor();
-                        } else {
-                            inputCaptureProvider.hideCursor();
-                        }
+                        runOnUiThread(this::toggleMouseLocalCursor);
+                        break;
+
+                    // Toggle the emulated local cursor
+                    case KeyEvent.KEYCODE_M:
+                        runOnUiThread(this::toggleEmulatedLocalCursor);
                         break;
 
                     default:
@@ -1990,6 +2023,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                 case KeyEvent.KEYCODE_Z:
                 case KeyEvent.KEYCODE_Q:
                 case KeyEvent.KEYCODE_C:
+                case KeyEvent.KEYCODE_M:
                     // Remember that a special key combo was activated, so we can consume all key
                     // events until the modifiers come up
                     specialKeyCode = androidKeyCode;
@@ -2532,14 +2566,20 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
             normalizedY = normalized[1];
         }
 
+        // Undo the pan/zoom transform on the video surface, so we hit what is shown under the finger
+        View surfaceView = streamContainer.getSurfaceView();
+        float[] videoRelative = getNormalizedCoordinates(surfaceView, normalizedX, normalizedY);
+        normalizedX = videoRelative[0];
+        normalizedY = videoRelative[1];
+
         normalizedX = Math.max(normalizedX, 0.0f);
         normalizedY = Math.max(normalizedY, 0.0f);
 
-        normalizedX = Math.min(normalizedX, streamContainer.getWidth());
-        normalizedY = Math.min(normalizedY, streamContainer.getHeight());
+        normalizedX = Math.min(normalizedX, surfaceView.getWidth());
+        normalizedY = Math.min(normalizedY, surfaceView.getHeight());
 
-        normalizedX /= streamContainer.getWidth();
-        normalizedY /= streamContainer.getHeight();
+        normalizedX /= surfaceView.getWidth();
+        normalizedY /= surfaceView.getHeight();
 
         return new float[] { normalizedX, normalizedY };
     }
@@ -2667,11 +2707,16 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
         float[] normalizedCoords = getStreamViewRelativeNormalizedXY(view, event, pointerIndex);
         float[] normalizedContactArea = getStreamViewNormalizedContactArea(event, pointerIndex);
-        return conn.sendPenEvent(eventType, toolType, penButtons,
+        boolean sent = conn.sendPenEvent(eventType, toolType, penButtons,
                 normalizedCoords[0], normalizedCoords[1],
                 getPressureOrDistance(event, pointerIndex),
                 normalizedContactArea[0], normalizedContactArea[1],
                 getRotationDegrees(event, pointerIndex), tiltDegrees) != MoonBridge.LI_ERR_UNSUPPORTED;
+        if (sent && localCursor != null) {
+            // The pen moves the host cursor without a mouse packet, so keep ours on top of it
+            localCursor.followExternalPointer(normalizedCoords[0], normalizedCoords[1], 1, 1);
+        }
+        return sent;
     }
 
     private static byte convertToolTypeToStylusToolType(MotionEvent event, int pointerIndex) {
@@ -2732,11 +2777,26 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     private boolean sendTouchEventForPointer(View view, MotionEvent event, byte eventType, int pointerIndex) {
         float[] normalizedCoords = getStreamViewRelativeNormalizedXY(view, event, pointerIndex);
         float[] normalizedContactArea = getStreamViewNormalizedContactArea(event, pointerIndex);
-        return conn.sendTouchEvent(eventType, event.getPointerId(pointerIndex),
+        int pointerId = event.getPointerId(pointerIndex);
+        boolean sent = conn.sendTouchEvent(eventType, pointerId,
                 normalizedCoords[0], normalizedCoords[1],
                 getPressureOrDistance(event, pointerIndex),
                 normalizedContactArea[0], normalizedContactArea[1],
                 getRotationDegrees(event, pointerIndex)) != MoonBridge.LI_ERR_UNSUPPORTED;
+        if (sent && localCursor != null) {
+            // The host moves its cursor with the primary (first) touch, so keep ours on top of it.
+            // The primary touch ends when that finger lifts, until every finger is up again.
+            if (eventType == MoonBridge.LI_TOUCH_EVENT_DOWN && event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                primaryTouchPointerId = pointerId;
+            }
+            if (pointerId == primaryTouchPointerId) {
+                localCursor.followExternalPointer(normalizedCoords[0], normalizedCoords[1], 1, 1);
+                if (eventType == MoonBridge.LI_TOUCH_EVENT_UP || eventType == MoonBridge.LI_TOUCH_EVENT_CANCEL) {
+                    primaryTouchPointerId = -1;
+                }
+            }
+        }
+        return sent;
     }
 
     private boolean trySendTouchEvent(View view, MotionEvent event) {
@@ -2836,7 +2896,14 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                 // Always update the position before sending any button events. If we're
                 // dealing with a stylus without hover support, our position might be
                 // significantly different than before.
-                if (inputCaptureProvider.eventHasRelativeMouseAxes(event)) {
+                if (inputCaptureProvider.eventHasRelativeMouseAxes(event) &&
+                        localCursor != null && localCursor.isEnabled()) {
+                    // Move the emulated cursor locally, keeping sub-pixel precision
+                    localCursor.onPhysicalMouseMotion(
+                            inputCaptureProvider.getRelativeAxisX(event),
+                            inputCaptureProvider.getRelativeAxisY(event));
+                }
+                else if (inputCaptureProvider.eventHasRelativeMouseAxes(event)) {
                     // Send the deltas straight from the motion event
                     short deltaX = (short)inputCaptureProvider.getRelativeAxisX(event);
                     short deltaY = (short)inputCaptureProvider.getRelativeAxisY(event);
@@ -3411,10 +3478,13 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         // Normalize these to the view size. We can't just drop them because we won't always get an event
         // right at the boundary of the view, so dropping them would result in our cursor never really
         // reaching the sides of the screen.
-        eventX = Math.min(Math.max(eventX, 0), streamContainer.getWidth());
-        eventY = Math.min(Math.max(eventY, 0), streamContainer.getHeight());
+        // Undo the pan/zoom transform on the video surface
+        View surfaceView = streamContainer.getSurfaceView();
+        float[] videoRelative = getNormalizedCoordinates(surfaceView, eventX, eventY);
+        eventX = Math.min(Math.max(videoRelative[0], 0), surfaceView.getWidth());
+        eventY = Math.min(Math.max(videoRelative[1], 0), surfaceView.getHeight());
 
-        conn.sendMousePosition((short)eventX, (short)eventY, (short) streamContainer.getWidth(), (short) streamContainer.getHeight());
+        conn.sendMousePosition((short)eventX, (short)eventY, (short) surfaceView.getWidth(), (short) surfaceView.getHeight());
     }
 
     @Override
@@ -3452,6 +3522,14 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     }
 
     private void stopConnection() {
+        if (connected && isHostCursorHiddenByUs()) {
+            // The host's cursor setting outlives this session, so put it back
+            toggleHostCursorVisibility();
+        }
+        if (localCursor != null) {
+            localCursor.setEnabled(false);
+        }
+
         if (connecting || connected) {
             connecting = connected = false;
             updatePipAutoEnter();
@@ -3696,6 +3774,9 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                     @Override
                     public void run() {
                         setInputGrabState(true);
+                        if (prefConfig.enableEmulatedLocalCursor && connected) {
+                            setEmulatedLocalCursorEnabled(true);
+                        }
                     }
                 }, 500);
 
@@ -3861,6 +3942,12 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
     @Override
     public void mouseMove(int deltaX, int deltaY) {
+        LocalCursorController cursor = localCursor;
+        if (cursor != null && cursor.isEnabled()) {
+            // Physical mouse via evdev: same handling as a captured mouse
+            cursor.onPhysicalMouseMotion(deltaX, deltaY);
+            return;
+        }
         conn.sendMouseMove((short) deltaX, (short) deltaY);
     }
 
@@ -4123,6 +4210,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         }
 
         options.add(new MouseModeOption(-1, getString(R.string.toggle_local_mouse_cursor)));
+        options.add(new MouseModeOption(-2, getString(R.string.toggle_emulated_local_cursor)));
 
         String[] labels = new String[options.size()];
         for (int i = 0; i < options.size(); i++) {
@@ -4137,6 +4225,8 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                     MouseModeOption selected = optionArray[which];
                     if (selected.index == -1) {
                         toggleMouseLocalCursor();
+                    } else if (selected.index == -2) {
+                        toggleEmulatedLocalCursor();
                     } else {
                         applyMouseMode(selected.index);
                         if (prefConfig.rememberMouseMode) {
@@ -4154,15 +4244,136 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     //本地鼠标光标切换
     private void toggleMouseLocalCursor(){
         if (!grabbedInput) {
-            inputCaptureProvider.enableCapture();
-            grabbedInput = true;
+            setInputGrabState(true);
         }
         cursorVisible = !cursorVisible;
         if (cursorVisible) {
+            // The Android cursor and the emulated cursor are mutually exclusive
+            setEmulatedLocalCursorEnabled(false);
             inputCaptureProvider.showCursor();
         } else {
             inputCaptureProvider.hideCursor();
         }
+    }
+
+    public void toggleEmulatedLocalCursor() {
+        if (localCursor == null) {
+            Toast.makeText(this, R.string.emulated_cursor_unavailable_3d, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        boolean enable = !localCursor.isEnabled();
+        setEmulatedLocalCursorEnabled(enable);
+        Toast.makeText(this, enable ? R.string.emulated_cursor_on : R.string.emulated_cursor_off,
+                Toast.LENGTH_SHORT).show();
+    }
+
+    private void setEmulatedLocalCursorEnabled(boolean enable) {
+        if (localCursor == null || localCursor.isEnabled() == enable) {
+            return;
+        }
+
+        if (enable) {
+            if (!grabbedInput) {
+                setInputGrabState(true);
+            }
+            // The emulated cursor needs pointer capture, which the Android cursor releases
+            if (cursorVisible) {
+                cursorVisible = false;
+                inputCaptureProvider.hideCursor();
+            }
+            localCursor.setSuspended(!grabbedInput);
+            localCursor.setEnabled(true);
+        }
+        else {
+            localCursor.setEnabled(false);
+        }
+        syncHostCursorVisibility.run();
+    }
+
+    // Hides the host cursor while the emulated cursor is on (if the user wants that) and shows it
+    // again once it's off. The hotkey can't be sent while the user holds one of its keys, so keep
+    // retrying until it goes through.
+    private final Runnable syncHostCursorVisibility = new Runnable() {
+        @Override
+        public void run() {
+            streamContainer.removeCallbacks(this);
+            if (!connected || localCursor == null) {
+                return;
+            }
+            boolean wantHidden = localCursor.isEnabled() && prefConfig.emulatedCursorHideHost;
+            if (wantHidden != isHostCursorHiddenByUs() && !toggleHostCursorVisibility()) {
+                streamContainer.postDelayed(this, 250);
+            }
+        }
+    };
+
+    // The host doesn't report whether it draws its cursor into the video. NvConnection mirrors
+    // the host's hotkey handling for every key we send, so an odd number of toggles this session
+    // means the cursor is hidden (assuming it was visible when we connected).
+    private boolean isHostCursorHiddenByUs() {
+        return conn != null && conn.isHostCursorToggled();
+    }
+
+    private void onVideoGeometryChanged() {
+        if (localCursor != null) {
+            localCursor.onVideoGeometryChanged();
+        }
+    }
+
+    /**
+     * Sends Ctrl+Alt+Shift+N, which Sunshine and Apollo use to toggle whether the host cursor is
+     * drawn into the video. The keys go out back to back (not through sendKeys(), which delays
+     * the key ups) so this is also safe right before the connection is stopped.
+     *
+     * @return false if the hotkey couldn't be sent
+     */
+    public boolean toggleHostCursorVisibility() {
+        if (conn == null || !connected) {
+            return false;
+        }
+
+        // The host matches the chord against its own key state, so the modifiers must be pressed
+        // for real. Modifiers the host already counts as held stay down afterwards. Holding the
+        // connection's lock keeps the sequence from interleaving with keys from other threads.
+        // NvConnection mirrors the host's hotkey handling and records the toggle.
+        final short[] modifierKeys = {
+                (short) KeyboardTranslator.VK_LCONTROL,
+                (short) KeyboardTranslator.VK_LMENU,
+                (short) KeyboardTranslator.VK_LSHIFT,
+        };
+        synchronized (conn) {
+            final byte heldModifiers = conn.getHostShortcutModifiers();
+
+            // Bail out if the host would drop one of our key downs as a duplicate: the chord
+            // wouldn't fire and our key up would release a key the user is holding.
+            if (conn.isHostKeyPressed(NvConnection.VK_N, (byte) 0)) {
+                return false;
+            }
+            for (short key : modifierKeys) {
+                if ((heldModifiers & getModifier(key)) == 0 && conn.isHostKeyPressed(key, (byte) 0)) {
+                    return false;
+                }
+            }
+
+            byte modifiers = heldModifiers;
+            for (short key : modifierKeys) {
+                byte flag = getModifier(key);
+                if ((heldModifiers & flag) == 0) {
+                    conn.sendKeyboardInput(key, KeyboardPacket.KEY_DOWN, modifiers, (byte) 0);
+                    modifiers |= flag;
+                }
+            }
+            conn.sendKeyboardInput((short) NvConnection.VK_N, KeyboardPacket.KEY_DOWN, modifiers, (byte) 0);
+            conn.sendKeyboardInput((short) NvConnection.VK_N, KeyboardPacket.KEY_UP, modifiers, (byte) 0);
+            for (int i = modifierKeys.length - 1; i >= 0; i--) {
+                byte flag = getModifier(modifierKeys[i]);
+                if ((heldModifiers & flag) == 0) {
+                    modifiers &= (byte) ~flag;
+                    conn.sendKeyboardInput(modifierKeys[i], KeyboardPacket.KEY_UP, modifiers, (byte) 0);
+                }
+            }
+        }
+        return true;
     }
 
     private void applyMouseMode(int mode) {

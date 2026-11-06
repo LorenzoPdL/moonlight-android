@@ -24,6 +24,7 @@ public class PanZoomHandler {
     private float childX, childY = 0;
     private float parentWidth, parentHeight = 0;
     private float childWidth, childHeight = 0;
+    private Runnable onTransformChanged;
 
     public PanZoomHandler(Context context, Game game, View streamView, View parent, PreferenceConfiguration prefConfig) {
         this.game = game;
@@ -37,6 +38,17 @@ public class PanZoomHandler {
         // Everything gets easier with 0,0 as the pivot point
         streamView.setPivotX(0);
         streamView.setPivotY(0);
+    }
+
+    /** Runs after every pan/zoom change to the stream view. */
+    public void setOnTransformChangedListener(Runnable listener) {
+        onTransformChanged = listener;
+    }
+
+    private void notifyTransformChanged() {
+        if (onTransformChanged != null) {
+            onTransformChanged.run();
+        }
     }
 
     public void handleTouchEvent(MotionEvent motionEvent) {
@@ -74,6 +86,7 @@ public class PanZoomHandler {
 
         streamView.setX(childX);
         streamView.setY(childY);
+        notifyTransformChanged();
     }
 
     public void handleSurfaceChange() {
@@ -165,6 +178,7 @@ public class PanZoomHandler {
         this.childY = offsetY;
         streamView.setX(childX);
         streamView.setY(childY);
+        notifyTransformChanged();
     }
 
     public float getScaleFactor() { return scaleFactor; }

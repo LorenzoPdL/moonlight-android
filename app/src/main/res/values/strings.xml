@@ -444,6 +444,19 @@
     <string name="summary_touchscreen_mode">Select between MultiTouch/SingleTouch/Trackpad/Disabled mode.\nPen/Stylus are still usable when Disabled is selected.\nForced to Track Pad(Natural) mode when useing external display.</string>
     <string name="title_checkbox_mouse_local_cursor">Use local mouse cursor</string>
     <string name="summary_checkbox_mouse_local_cursor">Default external physical mouse cursor will be captured, this option can display Android system cursor</string>
+    <string name="title_checkbox_emulated_local_cursor">Emulated local cursor</string>
+    <string name="summary_checkbox_emulated_local_cursor">Draw the mouse cursor on this device so it moves with zero latency, like Parsec. The host cursor follows it. Meant for desktop use; turn it off for games that use mouse look. Toggle in-stream with Ctrl+Alt+Shift+M</string>
+    <string name="title_checkbox_emulated_cursor_hide_host">Hide host cursor with emulated cursor</string>
+    <string name="summary_checkbox_emulated_cursor_hide_host">Sends Ctrl+Alt+Shift+N to Sunshine/Apollo to remove the host cursor from the video while the emulated cursor is on, and again to restore it</string>
+    <string name="title_emulated_cursor_size">Emulated cursor size</string>
+    <string name="summary_emulated_cursor_size">Match this to the host\'s cursor size (100% = Windows default at 100% scaling)</string>
+    <string name="title_emulated_cursor_sensitivity">Emulated cursor speed</string>
+    <string name="summary_emulated_cursor_sensitivity">Physical mouse speed while the emulated cursor is on</string>
+    <string name="toggle_emulated_local_cursor">Toggle emulated local cursor (zero latency)</string>
+    <string name="game_menu_toggle_host_cursor">Toggle host cursor in video</string>
+    <string name="emulated_cursor_on">Emulated local cursor: ON</string>
+    <string name="emulated_cursor_off">Emulated local cursor: OFF</string>
+    <string name="emulated_cursor_unavailable_3d">The emulated local cursor is not available in 3D render modes</string>
     <string name="title_checkbox_multi_touch_gestures">Enable multi-touch gestures</string>
     <string name="summary_checkbox_multi_touch_gestures">Enable 3 finger tap for keyboard, 4 finger tap for full keyboard, 5 finger tap for quick menu when using multi-touch mode.</string>
     <string name="title_checkbox_onscreen_style_official">Official Virtual Gamepad Skin</string>

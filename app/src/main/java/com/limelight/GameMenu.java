@@ -247,6 +247,8 @@ public class GameMenu implements Game.GameMenuCallbacks {
         if (game.allowChangeMouseMode) {
             options.add(new MenuOption(getString(R.string.game_menu_select_mouse_mode), true, () -> game.selectMouseMode(dialogScreenContext)));
         }
+        options.add(new MenuOption(getString(R.string.toggle_emulated_local_cursor), true, game::toggleEmulatedLocalCursor));
+        options.add(new MenuOption(getString(R.string.game_menu_toggle_host_cursor), true, game::toggleHostCursorVisibility));
         
         options.add(new MenuOption(getString(R.string.game_menu_toggle_hud), true, game::toggleHUD));
         options.add(new MenuOption(getString(R.string.game_menu_toggle_floating_button), true, game::toggleFloatingButtonVisibility));

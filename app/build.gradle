@@ -93,6 +93,19 @@ android {
         }
     }
 
+    signingConfigs {
+        // Release signing is read from the user's ~/.gradle/gradle.properties so the key and
+        // passwords never live in the repo. Without them, release builds come out unsigned.
+        if (project.hasProperty('ARTEMIS_STORE_FILE')) {
+            release {
+                storeFile file(ARTEMIS_STORE_FILE)
+                storePassword ARTEMIS_STORE_PASSWORD
+                keyAlias ARTEMIS_KEY_ALIAS
+                keyPassword ARTEMIS_KEY_PASSWORD
+            }
+        }
+    }
+
     buildTypes {
         debug {
             applicationIdSuffix ".noirdebug"
@@ -134,10 +147,14 @@ android {
             // is to please change the applicationId before you publish.
             //
             // TL;DR: Leave the following line alone!
-            applicationIdSuffix ".noir"
-            resValue "string", "app_label", "Artemis"
-            resValue "string", "app_label_root", "Artemis (Root)"
-            resValue "string", "app_label_game", "Artemis (Game)"
+            // Own ID so this fork installs next to the official Artemis (com.limelight.noir)
+            applicationIdSuffix ".noir.cursor"
+            resValue "string", "app_label", "Artemis Cursor"
+            resValue "string", "app_label_root", "Artemis Cursor (Root)"
+            resValue "string", "app_label_game", "Artemis Cursor (Game)"
+            if (signingConfigs.findByName('release') != null) {
+                signingConfig signingConfigs.release
+            }
 
             minifyEnabled true
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'

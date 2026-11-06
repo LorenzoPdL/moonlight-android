@@ -13,6 +13,7 @@ import android.net.NetworkInfo;
 import android.net.RouteInfo;
 import android.os.Build;
 
+import java.util.HashSet;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -40,6 +41,7 @@ import com.limelight.nvstream.http.LimelightCryptoProvider;
 import com.limelight.nvstream.http.NvApp;
 import com.limelight.nvstream.http.NvHTTP;
 import com.limelight.nvstream.http.PairingManager;
+import com.limelight.nvstream.input.KeyboardPacket;
 import com.limelight.nvstream.input.MouseButtonPacket;
 import com.limelight.nvstream.jni.MoonBridge;
 
@@ -50,6 +52,20 @@ public class NvConnection {
     private ConnectionContext context;
     private static Semaphore connectionAllowed = new Semaphore(1);
     private final boolean isMonkey;
+
+    /**
+     * Receives every pointer-moving packet before it is sent, so a client-side cursor can own the
+     * cursor position. Returning true means the interceptor sent its own packet instead.
+     */
+    public interface MouseMoveInterceptor {
+        // Deltas in host pixels
+        boolean onRelativeMouseMove(short deltaX, short deltaY);
+        // Deltas in a coordinate space of referenceWidth x referenceHeight
+        boolean onRelativeMouseMove(short deltaX, short deltaY, short referenceWidth, short referenceHeight);
+        boolean onAbsoluteMousePosition(short x, short y, short referenceWidth, short referenceHeight);
+    }
+
+    private volatile MouseMoveInterceptor mouseMoveInterceptor;
     private final Context appContext;
 
     public NvConnection(Context appContext, ComputerDetails.AddressTuple host, int httpsPort, String uniqueId, StreamConfiguration config, LimelightCryptoProvider cryptoProvider, X509Certificate serverCert)
@@ -487,14 +503,32 @@ public class NvConnection {
         }
     }
     
+    public void setMouseMoveInterceptor(MouseMoveInterceptor interceptor) {
+        mouseMoveInterceptor = interceptor;
+    }
+
     public void sendMouseMove(final short deltaX, final short deltaY)
     {
+        MouseMoveInterceptor interceptor = mouseMoveInterceptor;
+        if (interceptor != null && interceptor.onRelativeMouseMove(deltaX, deltaY)) {
+            return;
+        }
         if (!isMonkey) {
             MoonBridge.sendMouseMove(deltaX, deltaY);
         }
     }
 
     public void sendMousePosition(short x, short y, short referenceWidth, short referenceHeight)
+    {
+        MouseMoveInterceptor interceptor = mouseMoveInterceptor;
+        if (interceptor != null && interceptor.onAbsoluteMousePosition(x, y, referenceWidth, referenceHeight)) {
+            return;
+        }
+        sendMousePositionDirect(x, y, referenceWidth, referenceHeight);
+    }
+
+    // Sends an absolute position without consulting the interceptor. Used by the interceptor itself.
+    public void sendMousePositionDirect(short x, short y, short referenceWidth, short referenceHeight)
     {
         if (!isMonkey) {
             MoonBridge.sendMousePosition(x, y, referenceWidth, referenceHeight);
@@ -503,6 +537,10 @@ public class NvConnection {
 
     public void sendMouseMoveAsMousePosition(short deltaX, short deltaY, short referenceWidth, short referenceHeight)
     {
+        MouseMoveInterceptor interceptor = mouseMoveInterceptor;
+        if (interceptor != null && interceptor.onRelativeMouseMove(deltaX, deltaY, referenceWidth, referenceHeight)) {
+            return;
+        }
         if (!isMonkey) {
             MoonBridge.sendMouseMoveAsMousePosition(deltaX, deltaY, referenceWidth, referenceHeight);
         }
@@ -534,7 +572,85 @@ public class NvConnection {
         }
     }
 
-    public void sendKeyboardInput(final short keyMap, final byte keyDirection, final byte modifier, final byte flags) {
+    // Mirror of the host's keyboard state for its Ctrl+Alt+Shift+N "toggle cursor in video"
+    // hotkey, built from every key event we send. All keyboard input goes through
+    // sendKeyboardInput(), so this sees every path (physical keys, evdev, menus, custom
+    // shortcuts, on-screen keys). It follows Sunshine/Apollo's passthrough() in src/input.cpp:
+    // keys are identified by (keycode, flags), a duplicate down or an up for a key that isn't
+    // pressed is dropped, a fresh down while all shortcut flags are set is consumed as a hotkey,
+    // and each Shift/Ctrl/Alt flag is set by either side's down and cleared by either side's up.
+    // Only the modifiers and N matter here, so only those keys are tracked. Guarded by this.
+    public static final int VK_N = 0x4E;
+    private static final int SHORTCUT_SHIFT = KeyboardPacket.MODIFIER_SHIFT;
+    private static final int SHORTCUT_CTRL = KeyboardPacket.MODIFIER_CTRL;
+    private static final int SHORTCUT_ALT = KeyboardPacket.MODIFIER_ALT;
+    private static final int SHORTCUT_ALL = SHORTCUT_SHIFT | SHORTCUT_CTRL | SHORTCUT_ALT;
+    private final HashSet<Integer> hostPressedKeys = new HashSet<>();
+    private int hostShortcutFlags;
+    private boolean hostCursorToggled;
+
+    private static int shortcutFlagForKey(int vk) {
+        switch (vk) {
+            case 0x10: case 0xA0: case 0xA1: return SHORTCUT_SHIFT; // VK_(L|R)SHIFT
+            case 0x11: case 0xA2: case 0xA3: return SHORTCUT_CTRL;  // VK_(L|R)CONTROL
+            case 0x12: case 0xA4: case 0xA5: return SHORTCUT_ALT;   // VK_(L|R)MENU
+            default: return 0;
+        }
+    }
+
+    private static int keyPressId(int vk, byte flags) {
+        return vk << 8 | (flags & 0xFF);
+    }
+
+    /** Returns the Shift/Ctrl/Alt (KeyboardPacket.MODIFIER_*) flags the host's hotkey check sees as held. */
+    public synchronized byte getHostShortcutModifiers() {
+        return (byte) hostShortcutFlags;
+    }
+
+    public synchronized boolean isHostKeyPressed(int vk, byte flags) {
+        return hostPressedKeys.contains(keyPressId(vk, flags));
+    }
+
+    /**
+     * True if the keys sent during this connection have toggled the host's cursor-in-video
+     * setting an odd number of times.
+     */
+    public synchronized boolean isHostCursorToggled() {
+        return hostCursorToggled;
+    }
+
+    private void mirrorHostKeyEvent(int vk, boolean release, byte flags) {
+        int shortcutFlag = shortcutFlagForKey(vk);
+        if (shortcutFlag == 0 && vk != VK_N) {
+            return;
+        }
+
+        Integer id = keyPressId(vk, flags);
+        boolean pressed = hostPressedKeys.contains(id);
+        if (release != pressed) {
+            // Up for a key that isn't down, or a duplicate down: the host drops it
+            return;
+        }
+        if (!release && hostShortcutFlags == SHORTCUT_ALL && vk == VK_N) {
+            // Consumed as the hotkey; the host never marks N pressed
+            hostCursorToggled = !hostCursorToggled;
+            return;
+        }
+
+        if (release) {
+            hostPressedKeys.remove(id);
+            hostShortcutFlags &= ~shortcutFlag;
+        }
+        else {
+            hostPressedKeys.add(id);
+            hostShortcutFlags |= shortcutFlag;
+        }
+    }
+
+    // Synchronized so a multi-key sequence (see Game.toggleHostCursorVisibility()) can hold the
+    // lock and stay contiguous on the wire.
+    public synchronized void sendKeyboardInput(final short keyMap, final byte keyDirection, final byte modifier, final byte flags) {
+        mirrorHostKeyEvent(keyMap & 0xFF, keyDirection != KeyboardPacket.KEY_DOWN, flags);
         if (!isMonkey) {
             MoonBridge.sendKeyboardInput(keyMap, keyDirection, modifier, flags);
         }
